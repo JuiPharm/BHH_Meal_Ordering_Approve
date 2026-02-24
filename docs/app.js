@@ -1,7 +1,7 @@
 /* Approved Dashboard – GitHub Pages Frontend (static)
- * Features (per original requirement):
- * - Food House/Department update status (3 steps)
- * - PDF slip download
+ * Features (per requirement / original base code):
+ * - Food House/Department update status (3 steps) with passcode + role gate
+ * - PDF slip download (NO passcode)
  * - Sound alert for pending orders
  * - Auto refresh using version polling
  *
@@ -48,6 +48,7 @@ let lastPending=0;
 let alarmTimer=null;
 let alarmMp3Url="";
 
+// ----- Pending indicator -----
 function showIndicator(count){
   document.getElementById("pendingCount").textContent = String(count);
   const el = document.getElementById("pendingIndicator");
@@ -130,6 +131,7 @@ function initSoundUI(){
     toggle.textContent = collapsed ? "+" : "−";
   });
 
+  // Arm audio/notification permission on first click
   window.addEventListener("click", function onFirst(){
     const a=audioEl();
     a.muted=true;
@@ -168,13 +170,25 @@ function scheduleAlarm(){
 
 // ----- table + actions -----
 function isPending(st){
-  const s=String(st||""); 
+  const s=String(st||"");
   const done = s.includes("Food House รับ Order") || s.includes("Food House เตรียมอาหารเสร็จแล้ว") || s.includes("หน่วยงานรับอาหารแล้ว");
   return (!s || !done || s.includes("Pending"));
 }
+
+function orderSummary(r){
+  const items = [
+    ["ทูน่า", Number(r[10]||0)],
+    ["ปลา", Number(r[11]||0)],
+    ["ไก่", Number(r[12]||0)],
+    ["กุ้ง", Number(r[13]||0)],
+    ["Custom", Number(r[14]||0)],
+  ].filter(x=>x[1]>0).map(x=>`${x[0]}×${x[1]}`);
+  return items.length ? items.join(", ") : "—";
+}
+
 function actionCell(status){
   const slipBtn = `<div class="mt-2"><button class='btn btn-outline-secondary btn-sm w-100' data-action="slip"><i class="fas fa-file-pdf"></i> Download PDF</button></div>`;
-  const s=String(status||""); 
+  const s=String(status||"");
   if(isPending(s)){
     return `<div class="small text-warning mb-1"><strong>🔔 รอ Food House รับ Order</strong></div>
       <button class='btn btn-warning btn-sm w-100' data-action="step0"><i class="fas fa-check"></i> รับออเดอร์</button>${slipBtn}`;
@@ -191,14 +205,28 @@ function actionCell(status){
 }
 
 function buildTable(rows){
-  const mainHeaders=["Action","ID","สถานะ","วันที่","HN","ชื่อผู้ป่วย","วันเกิด","แพ้อาหาร","โรคประจำตัว","ผู้ส่ง","แผนก","แซนวิชทูน่า","ข้าวต้มปลา","ข้าวต้มไก่","ข้าวต้มกุ้ง","เมนู Custom","รายละเอียดอื่น"];
-  const hiddenHeaders=["รวมรายการ","รวมชิ้น","เวลารับ Order","Staff รับ Order","เวลาเตรียม","Staff เตรียม Order","เวลารับ Order ของ Department","Staff รับ Order ของ Department"];
+  // Visible columns (includes new summary column)
+  const mainHeaders=[
+    "Action","ID","สถานะ","วันที่","HN","ชื่อผู้ป่วย","วันเกิด","แพ้อาหาร","โรคประจำตัว","ผู้ส่ง","แผนก",
+    "รายการที่สั่ง",
+    "แซนวิชทูน่า","ข้าวต้มปลา","ข้าวต้มไก่","ข้าวต้มกุ้ง","เมนู Custom",
+    "รายละเอียดอื่น"
+  ];
+  // Responsive-hidden details
+  const hiddenHeaders=[
+    "รวมรายการ","รวมชิ้น",
+    "เวลารับ Order","Staff รับ Order",
+    "เวลาเตรียม","Staff เตรียม Order",
+    "เวลารับ Order ของ Department","Staff รับ Order ของ Department"
+  ];
 
   const data=(rows||[]).map(r=>[
     actionCell(r[1]),
     r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],
+    orderSummary(r),
     r[10],r[11],r[12],r[13],r[14],
     r[23] || "",
+    // hidden
     r[15],r[16],
     r[17],r[18],
     r[19],r[20],
@@ -227,13 +255,14 @@ function buildTable(rows){
     const action=this.getAttribute("data-action");
     const row=datatable.row($(this).closest("tr")).data();
     const id=Number(row[1]);
-    if(action==="slip") return downloadSlip(id);
+    if(action==="slip") return downloadSlip(id);           // ✅ no passcode
     if(action==="step0") return approveStep(id,0,"สำหรับ Food House เมื่อรับ Order อาหารแล้ว");
     if(action==="step1") return approveStep(id,1,"สำหรับ Food House เมื่อเตรียมอาหารเสร็จแล้ว");
     if(action==="step2") return approveStep(id,2,"สำหรับ Department");
   });
 }
 
+// ----- refresh loops -----
 async function refreshAll(){ const d=await apiGet("orders"); buildTable(d.rows); }
 async function refreshPending(){
   const d=await apiGet("pendingCount");
@@ -255,15 +284,21 @@ async function versionLoop(){
       await refreshAll();
       await refreshPending();
     }
-  }catch(e){}
+  }catch(e){ /* ignore */ }
   setTimeout(versionLoop, 4000);
 }
 
+// ----- actions -----
 async function approveStep(id, step, label){
   const { value: passcode } = await Swal.fire({
-    position:"top", title:"กรอกรหัสสำหรับการอนุมัติ", input:"password",
-    inputLabel: label, inputPlaceholder:"กรุณากรอกรหัสผ่าน",
-    allowOutsideClick:false, confirmButtonColor:"#0033A0", confirmButtonText:"ตกลง",
+    position:"top",
+    title:"กรอกรหัสสำหรับการอนุมัติ",
+    input:"password",
+    inputLabel: label,
+    inputPlaceholder:"กรุณากรอกรหัสผ่าน",
+    allowOutsideClick:false,
+    confirmButtonColor:"#0033A0",
+    confirmButtonText:"ตกลง",
     inputAttributes:{ maxlength:20, autocapitalize:"off", autocorrect:"off" }
   });
   if(!passcode) return;
@@ -271,24 +306,26 @@ async function approveStep(id, step, label){
     Swal.fire({title:"กำลังบันทึก...", allowOutsideClick:false, didOpen:()=>Swal.showLoading()});
     const res=await apiPost("updateStatus",{id,step,passcode});
     Swal.close();
-    Swal.fire({icon:res.warn?"warning":"success",title:res.warn?"อัปเดตสำเร็จ (มีคำเตือน)":"อัปเดตเรียบร้อย",text:res.warn||"",timer:res.warn?1600:900,showConfirmButton:!!res.warn});
-    await refreshAll(); await refreshPending();
+    Swal.fire({
+      icon:res.warn?"warning":"success",
+      title:res.warn?"อัปเดตสำเร็จ (มีคำเตือน)":"อัปเดตเรียบร้อย",
+      text:res.warn||"",
+      timer:res.warn?1600:900,
+      showConfirmButton:!!res.warn
+    });
+    await refreshAll();
+    await refreshPending();
   }catch(e){
     Swal.close();
     Swal.fire({icon:"error",title:"ผิดพลาด",text:e.message||"โปรดลองใหม่"});
   }
 }
+
+// ✅ Download slip WITHOUT passcode
 async function downloadSlip(id){
-  const { value: passcode } = await Swal.fire({
-    position:"top", title:"กรอกรหัสเพื่อดาวน์โหลดสลิป", input:"password",
-    inputLabel:"ยืนยันตัวตน (Food House / Department)", inputPlaceholder:"กรุณากรอกรหัสผ่าน",
-    allowOutsideClick:false, confirmButtonColor:"#0033A0", confirmButtonText:"ตกลง",
-    inputAttributes:{ maxlength:20, autocapitalize:"off", autocorrect:"off" }
-  });
-  if(!passcode) return;
   try{
     Swal.fire({title:"กำลังสร้างสลิป...", allowOutsideClick:false, didOpen:()=>Swal.showLoading()});
-    const res=await apiPost("slip",{id,passcode});
+    const res=await apiPost("slip",{id}); // no passcode
     Swal.close();
     const obj=res.data;
     const a=document.createElement("a");
@@ -303,11 +340,15 @@ async function downloadSlip(id){
 
 async function boot(){
   assertConfig();
+
+  // Apply branding if provided
   if(CFG.BRAND_TITLE) document.getElementById("brandTitle").textContent = CFG.BRAND_TITLE;
   if(CFG.BRAND_LOGO_URL) document.getElementById("brandLogo").src = CFG.BRAND_LOGO_URL;
   document.getElementById("envLabel").textContent = CFG.ENV_LABEL || "";
 
   initSoundUI();
+
+  // load alarm mp3 URL from backend (optional)
   try{
     const alarm=await apiGet("alarmUrl");
     alarmMp3Url=alarm.alarmMp3Url||"";
@@ -316,6 +357,7 @@ async function boot(){
 
   await refreshAll();
   await refreshPending();
+
   try{ const v=await apiGet("version"); lastVersion=Number(v.version||0); }catch(e){ lastVersion=0; }
   versionLoop();
 }
