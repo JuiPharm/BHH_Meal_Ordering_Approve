@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Meal Ordering • Approved</title>
+  <link rel="icon" href="./favicon.svg">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <link href="https://cdn.datatables.net/1.12.1/css/jquery.dataTables.min.css" rel="stylesheet">
+  <link href="https://cdn.datatables.net/responsive/2.3.0/css/responsive.dataTables.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.1.2/css/all.min.css">
+
+  <link rel="stylesheet" href="./styles.css">
+
+  <script src="https://code.jquery.com/jquery-3.5.1.js"></script>
+  <script src="https://cdn.datatables.net/1.12.1/js/jquery.dataTables.min.js"></script>
+  <script src="https://cdn.datatables.net/responsive/2.3.0/js/dataTables.responsive.min.js"></script>
+  <script src="//cdn.jsdelivr.net/npm/sweetalert2@10"></script>
+
+  <script src="./config.js"></script>
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <nav class="navbar navbar-expand-lg navbar-dark">
+    <div class="container py-2">
+      <a class="navbar-brand d-flex align-items-center" href="#">
+        <img src="https://lh5.googleusercontent.com/d/1NFBEZraekrmsBzfNJ0WqEHXzcxMSw4Ud" height="34" class="me-2" alt="Logo">
+        <span>Bangkok Hospital • Meal Ordering Approved</span>
+      </a>
+      <div class="ms-auto text-white small opacity-75" id="envLabel"></div>
+    </div>
+  </nav>
+
+  <div class="container my-3">
+    <div class="table-responsive">
+      <table id="datatable" class="display responsive nowrap" style="width:100%"></table>
+    </div>
+  </div>
+
+  <div id="pendingIndicator" class="pending-indicator d-none">
+    <div class="alert alert-warning mb-0" role="alert">
+      <h5 class="alert-heading">🔔 มีออเดอร์ที่รอดำเนินการ!</h5>
+      <p class="mb-0">จำนวน: <span id="pendingCount">0</span> รายการ</p>
+    </div>
+  </div>
+
+  <div id="soundControl" class="sound-control">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <h6 class="mb-0">🔊 การแจ้งเตือนเสียง</h6>
+      <button id="toggleSoundPanel" class="btn btn-sm btn-outline-secondary">−</button>
+    </div>
+    <div id="soundPanelContent">
+      <div class="mb-2">
+        <label class="form-label small">เลือกเสียง:</label>
+        <select id="soundSelect" class="form-select form-select-sm">
+          <option value="bell">🔔 กริ่ง</option>
+          <option value="chime">🎵 ระฆัง</option>
+          <option value="alert">⚠️ เตือนภัย</option>
+          <option value="notification">📱 แจ้งเตือน (ไฟล์ MP3)</option>
+          <option value="ding">🔔 กริ่งสั้น</option>
+        </select>
+      </div>
+      <div class="mb-2">
+        <label class="form-label small">ระดับเสียง: <span id="volumeValue">50</span>%</label>
+        <input type="range" id="volumeSlider" class="form-range" min="0" max="100" value="50">
+      </div>
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="soundEnabled" checked>
+        <label class="form-check-label small" for="soundEnabled">เปิดการแจ้งเตือนเสียง</label>
+      </div>
+    </div>
+  </div>
+
+  <audio id="alarmAudio" preload="auto" crossorigin="anonymous"></audio>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
