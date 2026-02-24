@@ -1,4 +1,4 @@
 window.APP_CONFIG = {
-  API_BASE_URL: "https://script.google.com/macros/s/AKfycbzkmCOtIgo3GTpaCAa8YVvRKCTSsClohgGmaAUEaLMhiA5I3KpjgHT4mg-9JnaqQKpY/exec",
+  API_BASE_URL: "https://damp-wind-f304.jui-pharmacist.workers.dev/",
   ENV_LABEL: "PROD"
 };
