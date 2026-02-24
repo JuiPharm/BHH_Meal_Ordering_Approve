@@ -1,9 +1,2 @@
-:root{ --bh-blue:#0033A0; }
-.navbar{ background:var(--bh-blue); }
-.pending-indicator{ position:fixed; top:80px; right:20px; z-index:1050; animation:pulse 2s infinite; }
-@keyframes pulse{ 0%{transform:scale(1);} 50%{transform:scale(1.05);} 100%{transform:scale(1);} }
-.sound-control{ position:fixed; bottom:20px; right:20px; z-index:1050; background:#fff; padding:15px; border-radius:10px; box-shadow:0 4px 6px rgba(0,0,0,.1); width:280px; }
-.sound-control.collapsed{ padding:10px; width:auto; }
-.pending-row{ background:#fff3cd !important; }
-#datatable{ border:1px solid #dee2e6; border-radius:10px; overflow:hidden; }
-#datatable thead th{ background:#f8f9fa; border-bottom:1px solid #dee2e6; }
+.navbar { background:#0033A0; }
+#datatable { border:1px solid #ddd; }
