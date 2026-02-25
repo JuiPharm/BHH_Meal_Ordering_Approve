@@ -26,6 +26,57 @@ const state = {
   masterGain: null
 };
 
+/* ---------------- Chrome / Desktop Notification (Card pop-up) ----------------
+ * Works when tab is in background (page still open), after user grants permission.
+ * If you need notifications even when tab is closed, implement PWA Service Worker + Push (not included).
+ */
+const notifyState = {
+  lastNotifyAt: 0,
+  lastNotifiedPending: 0,
+  minIntervalMs: 8000 // avoid spam
+};
+
+async function ensureNotificationPermission(){
+  if(!("Notification" in window)) return false;
+  if(Notification.permission === "granted") return true;
+  if(Notification.permission === "denied") return false;
+  try{
+    const p = await Notification.requestPermission();
+    return p === "granted";
+  }catch(_){ return false; }
+}
+
+function showPendingNotification(pendingCount){
+  if(!("Notification" in window)) return;
+  if(Notification.permission !== "granted") return;
+
+  const now = Date.now();
+  if(now - notifyState.lastNotifyAt < notifyState.minIntervalMs) return;
+  if(pendingCount <= 0) return;
+  if(pendingCount <= notifyState.lastNotifiedPending) return;
+
+  // Notify when tab not visible / not focused
+  if(document.visibilityState === "visible" && document.hasFocus()) return;
+
+  notifyState.lastNotifyAt = now;
+  notifyState.lastNotifiedPending = pendingCount;
+
+  try{
+    const title = "🍽️ มีรายการอาหาร Pending";
+    const body = `Pending: ${pendingCount} รายการ • กดเพื่อกลับไปหน้า Approved`;
+    const n = new Notification(title, {
+      body,
+      icon: "./favicon.svg",
+      badge: "./favicon.svg",
+      tag: "bhh-meal-pending",
+      renotify: true
+    });
+    n.onclick = () => { try{ window.focus(); }catch(_){} n.close(); };
+    setTimeout(()=>{ try{ n.close(); }catch(_){} }, 10000);
+  }catch(_){}
+}
+
+
 function el(id){ return document.getElementById(id); }
 
 function apiUrl(action, params = {}){
@@ -215,6 +266,7 @@ async function loadPendingCount(){
 
     if(n > state.lastPending){
       await playOnce();
+      showPendingNotification(n);
     }
     state.lastPending = n;
     scheduleAlarm();
@@ -470,6 +522,13 @@ function bindEvents(){
     if(act==="step1") return approveStep(id,1,"สำหรับ Food House เมื่อเตรียมอาหารเสร็จแล้ว");
     if(act==="step2") return approveStep(id,2,"สำหรับ Department");
   });
+
+// Ask notification permission on first user gesture (browser requirement)
+document.addEventListener("click", async function _askNotifOnce(){
+  document.removeEventListener("click", _askNotifOnce);
+  await ensureNotificationPermission();
+}, { once:true });
+
 }
 
 async function fetchAlarmUrl(){
