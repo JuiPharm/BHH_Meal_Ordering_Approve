@@ -1,157 +1,349 @@
-/* Approved Dashboard – GitHub Pages Frontend (static)
- * Features (per requirement / original base code):
- * - Food House/Department update status (3 steps) with passcode + role gate
- * - PDF slip download (NO passcode)
- * - Sound alert for pending orders
- * - Auto refresh using version polling
- *
- * Backend: Cloudflare Worker → GAS Web App
+/* Production-grade Approved UI (Modern Cards)
+ * - Auto refresh 2s using version check
+ * - Pending-first display
+ * - Approve with passcode (role handled by backend)
+ * - PDF no passcode
  */
+
 const CFG = window.APP_CONFIG || {};
 const API_BASE = (CFG.API_BASE_URL || "").trim();
 
-function assertConfig(){
-  if (!API_BASE){
-    document.body.innerHTML = `
-      <div style="max-width:720px;margin:40px auto;font-family:system-ui;padding:16px">
-        <h2>ยังไม่ได้ตั้งค่า API_BASE_URL</h2>
-        <p>กรุณาแก้ไฟล์ <code>docs/config.js</code> แล้วใส่ Worker URL</p>
-      </div>`;
-    throw new Error("Missing API_BASE_URL");
-  }
-}
-function apiUrl(action){
+const state = {
+  rows: [],
+  limit: Number(CFG.DEFAULT_LIMIT || 5),
+  offset: 0,
+  mode: "pending",  // pending|all
+  query: "",
+  lastVersion: 0,
+  timer: null,
+
+  alarmMp3Url: "",
+  lastPending: 0,
+  alarmTimer: null,
+
+  AC: null,
+  masterGain: null
+};
+
+function el(id){ return document.getElementById(id); }
+
+function apiUrl(action, params = {}){
   const u = new URL(API_BASE);
   u.searchParams.set("action", action);
+  Object.entries(params).forEach(([k,v])=>{
+    if(v===undefined || v===null || v==="") return;
+    u.searchParams.set(k, String(v));
+  });
   return u.toString();
 }
-async function apiGet(action){
-  const res = await fetch(apiUrl(action), { method:"GET" });
+async function apiGet(action, params){
+  const res = await fetch(apiUrl(action, params));
   const j = await res.json();
-  if (!j.ok) throw new Error((j.error && j.error.message) || "API error");
+  if(!j.ok) throw new Error((j.error && j.error.message) || "API error");
   return j.data;
 }
 async function apiPost(action, body){
   const res = await fetch(apiUrl(action), {
-    method:"POST",
-    headers:{ "Content-Type":"application/json" },
+    method: "POST",
+    headers: { "Content-Type":"application/json" },
     body: JSON.stringify(body || {})
   });
   const j = await res.json();
-  if (!j.ok) throw new Error((j.error && j.error.message) || "API error");
+  if(!j.ok) throw new Error((j.error && j.error.message) || "API error");
   return j;
 }
 
-let datatable=null;
-let lastVersion=0;
-let lastPending=0;
-let alarmTimer=null;
-let alarmMp3Url="";
-
-// ----- Pending indicator -----
-function showIndicator(count){
-  document.getElementById("pendingCount").textContent = String(count);
-  const el = document.getElementById("pendingIndicator");
-  if (count>0) el.classList.remove("d-none"); else el.classList.add("d-none");
+function escapeHtml(s){
+  return String(s??"").replace(/[&<>"']/g, m => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[m]));
 }
 
-// ----- sound / notifications -----
-let AC=null, masterGain=null;
-function audioEl(){ return document.getElementById("alarmAudio"); }
-function ensureAC(){
-  if(!AC){
-    AC = new (window.AudioContext||window.webkitAudioContext)();
-    masterGain = AC.createGain();
-    masterGain.connect(AC.destination);
+// Data headers indices (ตาม sheet ของคุณ)
+const IDX = {
+  id:0, status:1, date:2, hn:3, name:4, dob:5, allergy:6, comorb:7,
+  requester:8, dept:9,
+  tuna:10, fish:11, chicken:12, shrimp:13, custom:14,
+  note:23
+};
+
+function statusKind(status){
+  const s = String(status||"");
+  if(!s || s.includes("Pending")) return "pending";
+  if(s.includes("Food House รับ Order")) return "step1";
+  if(s.includes("Food House เตรียมอาหารเสร็จแล้ว")) return "step2";
+  if(s.includes("หน่วยงานรับอาหารแล้ว")) return "done";
+  return "pending";
+}
+
+function statusPill(kind){
+  if(kind==="pending") return `<span class="pill pill-warn">🔔 Pending</span>`;
+  if(kind==="step1") return `<span class="pill pill-info">🧑‍🍳 รับออเดอร์แล้ว</span>`;
+  if(kind==="step2") return `<span class="pill pill-ok">🍲 เตรียมเสร็จแล้ว</span>`;
+  return `<span class="pill pill-done">✅ เสร็จสิ้น</span>`;
+}
+
+function itemSummary(r){
+  const custom = String(r[IDX.custom]||"").trim();
+  const parts = [];
+
+  const n = (x)=> Number(String(x||"").replace(/,/g,"")) || 0;
+
+  const t = n(r[IDX.tuna]); if(t>0) parts.push(`ทูน่า×${t}`);
+  const f = n(r[IDX.fish]); if(f>0) parts.push(`ปลา×${f}`);
+  const c = n(r[IDX.chicken]); if(c>0) parts.push(`ไก่×${c}`);
+  const s = n(r[IDX.shrimp]); if(s>0) parts.push(`กุ้ง×${s}`);
+
+  if(custom){
+    const asNum = Number(String(custom).replace(/,/g,""));
+    if(Number.isFinite(asNum) && asNum>0) parts.push(`Custom×${asNum}`);
+    else parts.push(`Custom: ${custom}`);
+  }
+  return parts.length ? parts.join(", ") : "—";
+}
+
+function approveButton(kind, id){
+  if(kind==="pending") return `<button class="btn btn-warning btn-sm" data-act="step0" data-id="${id}">รับออเดอร์</button>`;
+  if(kind==="step1") return `<button class="btn btn-primary btn-sm" data-act="step1" data-id="${id}">เตรียมเสร็จ</button>`;
+  if(kind==="step2") return `<button class="btn btn-success btn-sm" data-act="step2" data-id="${id}">หน่วยงานรับแล้ว</button>`;
+  return `<button class="btn btn-outline-success btn-sm" disabled>เสร็จสิ้น</button>`;
+}
+
+function renderCard(r){
+  const id = r[IDX.id];
+  const status = r[IDX.status];
+  const kind = statusKind(status);
+
+  const cls = `order-card ${kind}`;
+
+  const note = String(r[IDX.note]||"").trim();
+  const allergy = String(r[IDX.allergy]||"").trim();
+  const comorb = String(r[IDX.comorb]||"").trim();
+
+  return `
+    <section class="${cls}" data-rowid="${id}">
+      <div class="order-top">
+        <div class="flex-grow-1">
+          <div class="d-flex flex-wrap gap-2 align-items-center">
+            ${statusPill(kind)}
+            <span class="pill pill-muted">ID: ${escapeHtml(id)}</span>
+            <span class="pill pill-muted">แผนก: ${escapeHtml(r[IDX.dept]||"-")}</span>
+            <span class="pill pill-muted">HN: ${escapeHtml(r[IDX.hn]||"-")}</span>
+          </div>
+
+          <div class="mt-2 fw-semibold fs-5">${escapeHtml(r[IDX.name]||"-")}</div>
+
+          <div class="meta">
+            <div>🗓️ <b>${escapeHtml(r[IDX.date]||"-")}</b></div>
+            <div>🎂 <b>${escapeHtml(r[IDX.dob]||"-")}</b></div>
+            <div>👤 ผู้สั่ง: <b>${escapeHtml(r[IDX.requester]||"-")}</b></div>
+          </div>
+
+          <div class="items">
+            <div class="summary">
+              <span class="pill pill-muted">🍽️ รายการ</span>
+              <span class="fw-semibold">${escapeHtml(itemSummary(r))}</span>
+            </div>
+
+            <div class="small-muted mt-1">
+              แพ้อาหาร: ${escapeHtml(allergy||"-")} • โรคประจำตัว: ${escapeHtml(comorb||"-")}
+            </div>
+
+            ${note ? `<div class="small mt-1"><b>หมายเหตุ:</b> ${escapeHtml(note)}</div>` : ``}
+
+            <div class="status-text">${escapeHtml(status||"")}</div>
+          </div>
+        </div>
+
+        <div class="btn-col">
+          ${approveButton(kind, id)}
+          <button class="btn btn-outline-secondary btn-sm" data-act="slip" data-id="${id}">Download PDF</button>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function filteredRows(){
+  const q = (state.query||"").trim().toLowerCase();
+  if(!q) return state.rows;
+  return state.rows.filter(r=>{
+    const s = [r[IDX.hn], r[IDX.name], r[IDX.dept], r[IDX.requester]].join(" ").toLowerCase();
+    return s.includes(q);
+  });
+}
+
+function render(){
+  const list = el("list");
+  const rows = filteredRows();
+  const slice = rows.slice(0, state.offset + state.limit);
+
+  list.innerHTML = slice.length
+    ? slice.map(renderCard).join("")
+    : `<div class="cardx">ไม่พบข้อมูล</div>`;
+
+  el("loadMoreBtn").disabled = slice.length >= rows.length;
+}
+
+function nowText(){
+  return new Date().toLocaleString("th-TH",{hour12:false});
+}
+
+async function loadRows(reset=false){
+  if(reset){
+    state.offset = 0;
+    state.rows = [];
+  }
+  const data = await apiGet("orders", { mode: state.mode, limit: 200 });
+  state.rows = Array.isArray(data.rows) ? data.rows : [];
+  render();
+  el("lastSync").textContent = `Sync: ${nowText()}`;
+}
+
+async function loadPendingCount(){
+  // ถ้า backend มี pendingCount endpoint ให้ใช้จะดีที่สุด
+  try{
+    const d = await apiGet("pendingCount");
+    const n = Number(d.pendingCount||0);
+    el("pendingBadge").textContent = `🔔 Pending: ${n}`;
+
+    if(n > state.lastPending){
+      await playOnce();
+    }
+    state.lastPending = n;
+    scheduleAlarm();
+  }catch(e){
+    // fallback: count from currently loaded rows (เร็ว แต่ไม่ exact ถ้า backend ไม่ส่งครบ)
+    const n = (state.rows||[]).filter(r => statusKind(r[IDX.status])!=="done").length;
+    el("pendingBadge").textContent = `🔔 Pending: ${n}`;
   }
 }
-function tone(freq,dur,type="sine",start=0,peak=1.0){
-  const osc=AC.createOscillator(), g=AC.createGain();
-  osc.type=type; osc.frequency.value=freq; osc.connect(g); g.connect(masterGain);
-  const t0=AC.currentTime+start;
-  g.gain.setValueAtTime(0.0001,t0);
-  g.gain.linearRampToValueAtTime(peak,t0+0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
-  osc.start(t0); osc.stop(t0+dur);
+
+/* ---------------- Sound (built-in + optional mp3) ---------------- */
+
+function audioEl(){ return el("alarmAudio"); }
+
+function ensureAC(){
+  if(!state.AC){
+    state.AC = new (window.AudioContext || window.webkitAudioContext)();
+    state.masterGain = state.AC.createGain();
+    state.masterGain.connect(state.AC.destination);
+  }
 }
+
+function tone(freq,dur,type="sine",start=0,peak=1.0){
+  const AC = state.AC;
+  const osc = AC.createOscillator();
+  const g = AC.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  osc.connect(g);
+  g.connect(state.masterGain);
+
+  const t0 = AC.currentTime + start;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(peak, t0 + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+
+  osc.start(t0);
+  osc.stop(t0 + dur);
+}
+
 function playBuiltInPattern(name){
   ensureAC();
-  if(AC.state==="suspended") AC.resume();
+  if(state.AC.state==="suspended") state.AC.resume();
+
   switch(name){
-    case "bell": tone(587,0.50,"triangle",0,0.85); tone(880,0.30,"triangle",0.18,0.7); break;
-    case "chime": tone(880,0.30,"sine",0,0.9); tone(660,0.25,"sine",0.28,0.8); break;
-    case "alert": for(let i=0;i<4;i++) tone(i%2?1200:900,0.12,"square",i*0.16,0.9); break;
-    case "ding": tone(1568,0.18,"sine",0,0.95); break;
-    default: tone(1000,0.12,"square",0,0.8); tone(1200,0.10,"square",0.16,0.8);
+    case "bell":
+      tone(587,0.50,"triangle",0,0.85);
+      tone(880,0.30,"triangle",0.18,0.7);
+      break;
+    case "chime":
+      tone(880,0.30,"sine",0,0.9);
+      tone(660,0.25,"sine",0.28,0.8);
+      break;
+    case "alert":
+      for(let i=0;i<4;i++) tone(i%2?1200:900,0.12,"square",i*0.16,0.9);
+      break;
+    case "ding":
+      tone(1568,0.18,"sine",0,0.95);
+      break;
+    default:
+      tone(1000,0.12,"square",0,0.8);
+      tone(1200,0.10,"square",0.16,0.8);
   }
 }
-function notifyOS(count){
-  if(typeof Notification==="undefined") return;
-  if(Notification.permission!=="granted") return;
-  new Notification("🍽️ มีออเดอร์ใหม่",{ body:`รอรับออเดอร์ ${count} รายการ`, requireInteraction:true });
-}
-function els(){
+
+function getSoundEls(){
   return {
-    sel: document.getElementById("soundSelect"),
-    vol: document.getElementById("volumeSlider"),
-    enabled: document.getElementById("soundEnabled"),
-    volLabel: document.getElementById("volumeValue"),
-    toggle: document.getElementById("toggleSoundPanel"),
-    panel: document.getElementById("soundControl"),
-    panelBody: document.getElementById("soundPanelContent"),
+    sel: el("soundSelect"),
+    vol: el("volumeSlider"),
+    enabled: el("soundEnabled"),
+    volLabel: el("volumeValue"),
+    toggle: el("toggleSoundPanel"),
+    panel: el("soundControl"),
+    panelBody: el("soundPanelContent")
   };
 }
+
 function initSoundUI(){
-  const {sel,vol,enabled,volLabel,toggle,panel,panelBody}=els();
+  const {sel,vol,enabled,volLabel,toggle,panel,panelBody} = getSoundEls();
+
   sel.value = localStorage.getItem("alertSound") || sel.value;
   vol.value = localStorage.getItem("alertVol") || vol.value;
-  volLabel.textContent = vol.value;
   enabled.checked = (localStorage.getItem("alertEnabled") !== "0");
+  volLabel.textContent = vol.value;
 
   function applyVol(){
     const v = Number(vol.value)/100;
-    if(masterGain) masterGain.gain.value=v;
-    const a=audioEl(); a.volume=v;
+    if(state.masterGain) state.masterGain.gain.value = v;
+    audioEl().volume = v;
   }
   applyVol();
 
   sel.addEventListener("change", ()=>{
     localStorage.setItem("alertSound", sel.value);
-    if(sel.value==="notification" && alarmMp3Url) audioEl().src=alarmMp3Url;
+    if(sel.value==="notification" && state.alarmMp3Url) audioEl().src = state.alarmMp3Url;
   });
+
   vol.addEventListener("input", ()=>{
     localStorage.setItem("alertVol", vol.value);
     volLabel.textContent = vol.value;
     applyVol();
   });
-  enabled.addEventListener("change", ()=> localStorage.setItem("alertEnabled", enabled.checked?"1":"0"));
+
+  enabled.addEventListener("change", ()=>{
+    localStorage.setItem("alertEnabled", enabled.checked ? "1" : "0");
+  });
+
   toggle.addEventListener("click", ()=>{
     const collapsed = panel.classList.toggle("collapsed");
     panelBody.style.display = collapsed ? "none" : "";
     toggle.textContent = collapsed ? "+" : "−";
   });
 
-  // Arm audio/notification permission on first click
+  // unlock audio on first click (browser restriction)
   window.addEventListener("click", function onFirst(){
-    const a=audioEl();
-    a.muted=true;
+    const a = audioEl();
+    a.muted = true;
     a.play().then(()=>{ a.pause(); a.currentTime=0; a.muted=false; }).catch(()=>{});
-    if(typeof Notification!=="undefined" && Notification.permission==="default") Notification.requestPermission();
     window.removeEventListener("click", onFirst);
-  }, {once:true});
+  }, { once:true });
 }
+
 async function playOnce(){
-  const {sel,enabled}=els();
+  const {sel,enabled} = getSoundEls();
   if(!enabled.checked) return false;
-  if(sel.value==="notification" && alarmMp3Url){
+
+  if(sel.value==="notification" && state.alarmMp3Url){
     try{
-      const a=audioEl();
-      if(a.src!==alarmMp3Url) a.src=alarmMp3Url;
-      a.currentTime=0;
+      const a = audioEl();
+      if(a.src !== state.alarmMp3Url) a.src = state.alarmMp3Url;
+      a.currentTime = 0;
       await a.play();
-      setTimeout(()=>{ try{ a.pause(); }catch(e){} }, 2500);
+      setTimeout(()=>{ try{ a.pause(); }catch(_){} }, 2500);
       return true;
-    }catch(e){
+    }catch(_){
       playBuiltInPattern("notification");
       return false;
     }
@@ -159,206 +351,174 @@ async function playOnce(){
   playBuiltInPattern(sel.value);
   return true;
 }
+
 function scheduleAlarm(){
-  if(alarmTimer) clearInterval(alarmTimer);
-  if(lastPending<=0) return;
-  alarmTimer=setInterval(async ()=>{
-    const ok=await playOnce();
-    if(!ok && document.hidden) notifyOS(lastPending);
-  }, 15000);
+  if(state.alarmTimer) clearInterval(state.alarmTimer);
+  if(state.lastPending<=0) return;
+  state.alarmTimer = setInterval(()=>{ playOnce(); }, 15000);
 }
 
-// ----- table + actions -----
-function isPending(st){
-  const s=String(st||"");
-  const done = s.includes("Food House รับ Order") || s.includes("Food House เตรียมอาหารเสร็จแล้ว") || s.includes("หน่วยงานรับอาหารแล้ว");
-  return (!s || !done || s.includes("Pending"));
-}
+/* ---------------- Actions ---------------- */
 
-function orderSummary(r){
-  const items = [
-    ["ทูน่า", Number(r[10]||0)],
-    ["ปลา", Number(r[11]||0)],
-    ["ไก่", Number(r[12]||0)],
-    ["กุ้ง", Number(r[13]||0)],
-    ["Custom", Number(r[14]||0)],
-  ].filter(x=>x[1]>0).map(x=>`${x[0]}×${x[1]}`);
-  return items.length ? items.join(", ") : "—";
-}
-
-function actionCell(status){
-  const slipBtn = `<div class="mt-2"><button class='btn btn-outline-secondary btn-sm w-100' data-action="slip"><i class="fas fa-file-pdf"></i> Download PDF</button></div>`;
-  const s=String(status||"");
-  if(isPending(s)){
-    return `<div class="small text-warning mb-1"><strong>🔔 รอ Food House รับ Order</strong></div>
-      <button class='btn btn-warning btn-sm w-100' data-action="step0"><i class="fas fa-check"></i> รับออเดอร์</button>${slipBtn}`;
-  }
-  if(s.includes("Food House รับ Order")){
-    return `<div class="small text-info mb-1"><i class="fas fa-clock"></i> กำลังเตรียมอาหาร</div>
-      <button class='btn btn-primary btn-sm w-100' data-action="step1"><i class="fas fa-utensils"></i> เตรียมเสร็จ</button>${slipBtn}`;
-  }
-  if(s.includes("Food House เตรียมอาหารเสร็จแล้ว")){
-    return `<div class="small text-success mb-1"><i class="fas fa-truck"></i> รอหน่วยงานรับ</div>
-      <button class='btn btn-success btn-sm w-100' data-action="step2"><i class="fas fa-check-circle"></i> หน่วยงานรับแล้ว</button>${slipBtn}`;
-  }
-  return `<div class="small text-success"><i class="fas fa-check-double"></i> เสร็จสิ้น</div>${slipBtn}`;
-}
-
-function buildTable(rows){
-  // Visible columns (includes new summary column)
-  const mainHeaders=[
-    "Action","ID","สถานะ","วันที่","HN","ชื่อผู้ป่วย","วันเกิด","แพ้อาหาร","โรคประจำตัว","ผู้ส่ง","แผนก",
-    "รายการที่สั่ง",
-    "แซนวิชทูน่า","ข้าวต้มปลา","ข้าวต้มไก่","ข้าวต้มกุ้ง","เมนู Custom",
-    "รายละเอียดอื่น"
-  ];
-  // Responsive-hidden details
-  const hiddenHeaders=[
-    "รวมรายการ","รวมชิ้น",
-    "เวลารับ Order","Staff รับ Order",
-    "เวลาเตรียม","Staff เตรียม Order",
-    "เวลารับ Order ของ Department","Staff รับ Order ของ Department"
-  ];
-
-  const data=(rows||[]).map(r=>[
-    actionCell(r[1]),
-    r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],
-    orderSummary(r),
-    r[10],r[11],r[12],r[13],r[14],
-    r[23] || "",
-    // hidden
-    r[15],r[16],
-    r[17],r[18],
-    r[19],r[20],
-    r[21],r[22]
-  ]);
-
-  const columns=[...mainHeaders.map(h=>({title:h,className:"all"})),...hiddenHeaders.map(h=>({title:h,className:"none"}))];
-
-  if(datatable){ datatable.clear().rows.add(data).draw(); return; }
-
-  datatable=$("#datatable").DataTable({
-    data, columns,
-    language:{url:"//cdn.datatables.net/plug-ins/1.10.24/i18n/Thai.json"},
-    responsive:{details:{type:"inline"}},
-    stateSave:true, deferRender:true,
-    pageLength:25, lengthMenu:[[10,25,50,100],[10,25,50,100]],
-    order:[[1,"desc"]],
-    columnDefs:[
-      {targets:[0],orderable:false,searchable:false},
-      {targets:[2],render:(d)=>isPending(d)?'<span class="badge bg-warning text-dark">🔔 Pending</span>':d}
-    ],
-    rowCallback:(row,rowData)=>{ if(isPending(rowData[2])) $(row).addClass("pending-row"); }
-  });
-
-  $("#datatable").on("click","button[data-action]", async function(){
-    const action=this.getAttribute("data-action");
-    const row=datatable.row($(this).closest("tr")).data();
-    const id=Number(row[1]);
-    if(action==="slip") return downloadSlip(id);           // ✅ no passcode
-    if(action==="step0") return approveStep(id,0,"สำหรับ Food House เมื่อรับ Order อาหารแล้ว");
-    if(action==="step1") return approveStep(id,1,"สำหรับ Food House เมื่อเตรียมอาหารเสร็จแล้ว");
-    if(action==="step2") return approveStep(id,2,"สำหรับ Department");
-  });
-}
-
-// ----- refresh loops -----
-async function refreshAll(){ const d=await apiGet("orders"); buildTable(d.rows); }
-async function refreshPending(){
-  const d=await apiGet("pendingCount");
-  const count=Number(d.pendingCount||0);
-  showIndicator(count);
-  if(count>lastPending){
-    const ok=await playOnce();
-    if(!ok && document.hidden) notifyOS(count);
-  }
-  lastPending=count;
-  scheduleAlarm();
-}
-async function versionLoop(){
-  try{
-    const d=await apiGet("version");
-    const v=Number(d.version||0);
-    if(v!==lastVersion){
-      lastVersion=v;
-      await refreshAll();
-      await refreshPending();
-    }
-  }catch(e){ /* ignore */ }
-  setTimeout(versionLoop, 4000);
-}
-
-// ----- actions -----
 async function approveStep(id, step, label){
   const { value: passcode } = await Swal.fire({
-    position:"top",
-    title:"กรอกรหัสสำหรับการอนุมัติ",
-    input:"password",
+    position: "top",
+    title: "กรอกรหัสสำหรับการอนุมัติ",
+    input: "password",
     inputLabel: label,
-    inputPlaceholder:"กรุณากรอกรหัสผ่าน",
-    allowOutsideClick:false,
-    confirmButtonColor:"#0033A0",
-    confirmButtonText:"ตกลง",
-    inputAttributes:{ maxlength:20, autocapitalize:"off", autocorrect:"off" }
+    inputPlaceholder: "กรุณากรอกรหัสผ่าน",
+    allowOutsideClick: false,
+    confirmButtonColor: "#0033A0",
+    confirmButtonText: "ตกลง"
   });
   if(!passcode) return;
+
   try{
     Swal.fire({title:"กำลังบันทึก...", allowOutsideClick:false, didOpen:()=>Swal.showLoading()});
-    const res=await apiPost("updateStatus",{id,step,passcode});
+    const res = await apiPost("updateStatus", { id, step, passcode });
     Swal.close();
-    Swal.fire({
-      icon:res.warn?"warning":"success",
-      title:res.warn?"อัปเดตสำเร็จ (มีคำเตือน)":"อัปเดตเรียบร้อย",
-      text:res.warn||"",
-      timer:res.warn?1600:900,
-      showConfirmButton:!!res.warn
-    });
-    await refreshAll();
-    await refreshPending();
+
+    // patch status in memory (instant UI update)
+    const idx = state.rows.findIndex(r => Number(r[IDX.id]) === Number(id));
+    if(idx>=0) state.rows[idx][IDX.status] = res.status || res.data?.status || state.rows[idx][IDX.status];
+
+    render();
+    await loadPendingCount();
+
+    Swal.fire({icon:"success", title:"อัปเดตเรียบร้อย", timer:900, showConfirmButton:false});
   }catch(e){
     Swal.close();
-    Swal.fire({icon:"error",title:"ผิดพลาด",text:e.message||"โปรดลองใหม่"});
+    Swal.fire({icon:"error", title:"ผิดพลาด", text:e.message || "โปรดลองใหม่"});
   }
 }
 
-// ✅ Download slip WITHOUT passcode
 async function downloadSlip(id){
   try{
-    Swal.fire({title:"กำลังสร้างสลิป...", allowOutsideClick:false, didOpen:()=>Swal.showLoading()});
-    const res=await apiPost("slip",{id}); // no passcode
+    Swal.fire({title:"กำลังสร้าง PDF...", allowOutsideClick:false, didOpen:()=>Swal.showLoading()});
+    const res = await apiPost("slip", { id }); // NO passcode
     Swal.close();
-    const obj=res.data;
-    const a=document.createElement("a");
-    a.href="data:application/pdf;base64,"+obj.b64;
-    a.download=obj.filename||("MealSlip_"+id+".pdf");
-    document.body.appendChild(a); a.click(); a.remove();
+
+    const obj = res.data;
+    const a = document.createElement("a");
+    a.href = "data:application/pdf;base64," + obj.b64;
+    a.download = obj.filename || `MealSlip_${id}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }catch(e){
     Swal.close();
-    Swal.fire({icon:"error",title:"ล้มเหลว",text:e.message||"โปรดลองใหม่"});
+    Swal.fire({icon:"error", title:"ล้มเหลว", text:e.message || "โปรดลองใหม่"});
   }
+}
+
+/* ---------------- Boot + Polling ---------------- */
+
+function applyBrand(){
+  el("brandTitle").textContent = CFG.BRAND_TITLE || "Meal Ordering • Approved";
+  el("brandLogo").src = CFG.BRAND_LOGO_URL || "";
+  el("envLabel").textContent = CFG.ENV_LABEL || "";
+}
+
+function bindEvents(){
+  el("limitSelect").addEventListener("change", (ev)=>{
+    state.limit = Number(ev.target.value || 5);
+    render();
+  });
+
+  el("searchBox").addEventListener("input", (ev)=>{
+    state.query = ev.target.value || "";
+    render();
+  });
+
+  el("loadMoreBtn").addEventListener("click", ()=>{
+    state.offset += state.limit;
+    render();
+  });
+
+  el("refreshBtn").addEventListener("click", async ()=>{
+    await Promise.all([loadRows(true), loadPendingCount()]);
+  });
+
+  el("pendingOnly").addEventListener("change", async (ev)=>{
+    state.mode = ev.target.checked ? "pending" : "all";
+    await loadRows(true);
+  });
+
+  el("autoRefresh").addEventListener("change", (ev)=>{
+    if(ev.target.checked) startPolling();
+    else stopPolling();
+  });
+
+  el("list").addEventListener("click", (ev)=>{
+    const btn = ev.target.closest("button[data-act]");
+    if(!btn) return;
+    const act = btn.getAttribute("data-act");
+    const id = Number(btn.getAttribute("data-id"));
+
+    if(act==="slip") return downloadSlip(id);
+    if(act==="step0") return approveStep(id,0,"สำหรับ Food House เมื่อรับ Order อาหารแล้ว");
+    if(act==="step1") return approveStep(id,1,"สำหรับ Food House เมื่อเตรียมอาหารเสร็จแล้ว");
+    if(act==="step2") return approveStep(id,2,"สำหรับ Department");
+  });
+}
+
+async function fetchAlarmUrl(){
+  try{
+    const d = await apiGet("alarmUrl");
+    state.alarmMp3Url = d.alarmMp3Url || "";
+    const {sel} = getSoundEls();
+    if(sel.value==="notification" && state.alarmMp3Url){
+      audioEl().src = state.alarmMp3Url;
+    }
+  }catch(_){
+    state.alarmMp3Url = "";
+  }
+}
+
+async function pollTick(){
+  // ลดโหลด: ถ้า version เปลี่ยนค่อยโหลด orders ใหม่
+  try{
+    const v = Number((await apiGet("version")).version || 0);
+    if(v !== state.lastVersion){
+      state.lastVersion = v;
+      await loadRows(true);
+    }
+    await loadPendingCount();
+  }catch(_){
+    // ignore
+  }
+}
+
+function startPolling(){
+  stopPolling();
+  const ms = Number(CFG.POLL_MS || 2000);
+  state.timer = setInterval(pollTick, ms);
+}
+function stopPolling(){
+  if(state.timer) clearInterval(state.timer);
+  state.timer = null;
 }
 
 async function boot(){
-  assertConfig();
+  if(!API_BASE){
+    document.body.innerHTML = `<div class="p-4">Missing API_BASE_URL in config.js</div>`;
+    return;
+  }
 
-  // Apply branding if provided
-  if(CFG.BRAND_TITLE) document.getElementById("brandTitle").textContent = CFG.BRAND_TITLE;
-  if(CFG.BRAND_LOGO_URL) document.getElementById("brandLogo").src = CFG.BRAND_LOGO_URL;
-  document.getElementById("envLabel").textContent = CFG.ENV_LABEL || "";
-
+  applyBrand();
   initSoundUI();
 
-  // load alarm mp3 URL from backend (optional)
-  try{
-    const alarm=await apiGet("alarmUrl");
-    alarmMp3Url=alarm.alarmMp3Url||"";
-    if(document.getElementById("soundSelect").value==="notification" && alarmMp3Url) audioEl().src=alarmMp3Url;
-  }catch(e){ alarmMp3Url=""; }
+  await fetchAlarmUrl();
+  await loadRows(true);
+  await loadPendingCount();
 
-  await refreshAll();
-  await refreshPending();
+  // init version
+  try{ state.lastVersion = Number((await apiGet("version")).version || 0); }catch(_){}
 
-  try{ const v=await apiGet("version"); lastVersion=Number(v.version||0); }catch(e){ lastVersion=0; }
-  versionLoop();
+  if(el("autoRefresh").checked) startPolling();
 }
-document.addEventListener("DOMContentLoaded", boot);
+
+document.addEventListener("DOMContentLoaded", ()=>{
+  bindEvents();
+  boot();
+});
